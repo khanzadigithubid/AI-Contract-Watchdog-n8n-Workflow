@@ -2,7 +2,50 @@
 
 > An intelligent n8n automation that monitors contract PDFs in Google Drive, extracts key renewal dates using Claude AI (Anthropic), and emails you before auto-renewals sneak up on you.
 
-![Workflow Diagram](images/workflow-diagram.png)
+---
+
+## 🗺️ Workflow Architecture
+
+```mermaid
+flowchart TD
+    subgraph A["🅐  When a contract arrives"]
+        A1([🟦 Drive Trigger\nNew file in\ncontracts folder]) --> A2{🟩 Is it a PDF?\nIF node}
+        A2 -- yes --> A3[🟩 Download file\nGoogle Drive\ngets the PDF]
+        A2 -- no --> A_no[🟧 Not a PDF\nGmail alert\nasks for a PDF]
+        A3 --> A4[🟦 Prepare PDF\nCode node\nconverts to base64]
+        A4 --> A5[🟪 Claude reads\nAnthropic API\nretries 3 times]
+        A5 --> A6[🟦 Parse result\nCode node\nchecks JSON + dates]
+        A6 --> A7[🟩 Save to Sheet\nAppend or update\nmatched by file_id]
+        A7 --> A8{🟩 Needs review?\nIF node\nlow confidence}
+        A8 -- yes --> A_rev[🟧 Review alert\nGmail alert\nfix row, set ok]
+    end
+
+    subgraph GS["📊 Google Sheet: Contracts\none row per contract · key = file_id · status: ok / needs_review"]
+    end
+
+    subgraph B["🅑  Every morning, 9 AM"]
+        B1([🟦 Daily 9 AM\nSchedule trigger\nAsia/Karachi]) --> B2[🟩 Read contracts\nGoogle Sheets\nall rows]
+        B2 --> B3[🟦 Find renewals\nCode node\ncancel window open]
+        B3 --> B4[🟦 Build email\nCode node\ntable + risk total]
+        B4 --> B5[🟧 Send alert\nGmail\nonly if urgency up]
+        B5 --> B6[🟦 Prepare flags\nCode node\nlevel and date]
+        B6 --> B7[🟩 Mark alerted\nSheets update\nmatched by file_id]
+    end
+
+    subgraph C["🅒  If anything breaks"]
+        C1([🟦 Error trigger\nAny node fails]) --> C2[🟦 Format error\nCode node\nnode + message]
+        C2 --> C3[🟧 Error alert\nGmail alert\nwith run link]
+    end
+
+    A7 -- write row --> GS
+    GS -- read --> B2
+    B7 -- update flags --> GS
+
+    style A fill:#0d1117,stroke:#30a46c,color:#fff
+    style B fill:#0d1117,stroke:#30a46c,color:#fff
+    style C fill:#0d1117,stroke:#e05252,color:#fff
+    style GS fill:#0d1117,stroke:#30a46c,color:#fff
+```
 
 ---
 
@@ -80,9 +123,7 @@ One row per contract, keyed by `file_id`.
 ```
 ai-contract-watchdog-n8n-workflow/
 ├── ai-contract-watchdog-n8n-workflow.json   # n8n workflow export
-├── images/
-│   └── workflow-diagram.png                 # Workflow architecture diagram
-└── README.md
+└── README.md                                # Documentation + architecture diagram
 ```
 
 ---
