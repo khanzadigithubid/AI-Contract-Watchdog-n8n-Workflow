@@ -1,4 +1,4 @@
-# 🐕 AI Contract Watchdog — n8n Workflow
+# AI Contract Watchdog — n8n Workflow
 
 > An intelligent n8n automation that monitors contract PDFs in Google Drive, extracts key renewal dates using Claude AI (Anthropic), and emails you before auto-renewals sneak up on you.
 
@@ -144,4 +144,4 @@ MIT License — free to use, modify, and share.
 
 ---
 
-*Built with ❤️ using n8n + Claude AI*
+*Built with ❤️ using n8n
