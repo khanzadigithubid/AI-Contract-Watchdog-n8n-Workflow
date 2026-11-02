@@ -1,0 +1,688 @@
+{
+  "name": "Contract & Renewal Watchdog v1",
+  "nodes": [
+    {
+      "id": "a1",
+      "name": "Contract Uploaded",
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "YOUR_CONTRACTS_FOLDER_ID",
+          "mode": "id"
+        },
+        "event": "fileCreated",
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "id": "a2",
+      "name": "Is PDF?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.mimeType }}",
+              "rightValue": "application/pdf",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a3",
+      "name": "Download Contract",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        480,
+        -100
+      ],
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "id": "a4",
+      "name": "Prepare Claude Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        -100
+      ],
+      "parameters": {
+        "jsCode": "\nconst meta = $('Contract Uploaded').first().json;\nconst buf = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst MAX = 30 * 1024 * 1024;\nif (buf.length > MAX) {\n  throw new Error(`File too large for Claude PDF input (${(buf.length/1048576).toFixed(1)} MB, limit ~30 MB): ${meta.name}`);\n}\nconst b64 = buf.toString('base64');\n\nconst prompt = `You are a contract analyst. Read the attached contract (it may be scanned; read it visually if needed).\nReturn ONLY a valid JSON object. No markdown, no commentary. Use null when a field is not stated.\nDates must be YYYY-MM-DD. If the contract has an initial term plus automatic renewal terms, \"end_date\" is the end of the CURRENT/initial term.\nFields:\n{\n  \"vendor\": string,\n  \"contract_type\": string (e.g. SaaS, lease, services, NDA, supply),\n  \"start_date\": string|null,\n  \"end_date\": string|null,\n  \"auto_renew\": boolean|null,\n  \"renewal_term_months\": number|null,\n  \"notice_period_days\": number|null (days of written notice required before end_date to cancel/avoid renewal),\n  \"annual_cost\": number|null (annualise if billed monthly/quarterly),\n  \"currency\": string|null (ISO code),\n  \"penalty_clause\": string|null (early termination / late cancellation penalty, max 25 words),\n  \"summary\": string (max 2 sentences),\n  \"confidence\": \"high\"|\"medium\"|\"low\" (how sure you are about end_date, auto_renew and notice_period_days),\n  \"review_reason\": string|null (what is unclear, if anything)\n}`;\n\nreturn [{\n  json: {\n    file_id: meta.id,\n    file_name: meta.name,\n    file_link: meta.webViewLink || '',\n    body: {\n      model: 'claude-sonnet-5-5',\n      max_tokens: 1500,\n      messages: [{\n        role: 'user',\n        content: [\n          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: b64 } },\n          { type: 'text', text: prompt }\n        ]\n      }]\n    }\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "a5",
+      "name": "Claude: Read Contract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        -100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Anthropic API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "a6",
+      "name": "Parse Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        -100
+      ],
+      "parameters": {
+        "jsCode": "\nconst meta = $('Prepare Claude Request').first().json;\nconst res = $input.first().json;\nconst today = new Date().toISOString().slice(0, 10);\n\nconst row = {\n  file_id: meta.file_id, file_name: meta.file_name, file_link: meta.file_link,\n  vendor: '', contract_type: '', start_date: '', end_date: '', auto_renew: '',\n  notice_period_days: '', annual_cost: '', currency: '', penalty_clause: '',\n  summary: '', status: 'needs_review', review_reason: '', added_on: today\n};\n\ntry {\n  if (res.error) throw new Error('Claude API error: ' + (res.error.message || JSON.stringify(res.error)));\n  const text = (res.content || []).filter(c => c.type === 'text').map(c => c.text).join('');\n  if (!text) throw new Error('Empty response from Claude');\n  const start = text.indexOf('{'), end = text.lastIndexOf('}');\n  if (start < 0 || end < 0) throw new Error('No JSON found in response');\n  const d = JSON.parse(text.slice(start, end + 1));\n\n  row.vendor = d.vendor ?? '';\n  row.contract_type = d.contract_type ?? '';\n  row.start_date = d.start_date ?? '';\n  row.end_date = d.end_date ?? '';\n  row.auto_renew = d.auto_renew === null || d.auto_renew === undefined ? '' : String(d.auto_renew);\n  row.notice_period_days = d.notice_period_days ?? '';\n  row.annual_cost = d.annual_cost ?? '';\n  row.currency = d.currency ?? '';\n  row.penalty_clause = d.penalty_clause ?? '';\n  row.summary = d.summary ?? '';\n\n  const problems = [];\n  if (!row.end_date || isNaN(new Date(row.end_date))) problems.push('end_date missing or invalid');\n  if (d.confidence === 'low') problems.push('low confidence');\n  if (d.review_reason) problems.push(d.review_reason);\n  if (problems.length) {\n    row.review_reason = problems.join('; ');\n  } else {\n    row.status = 'ok';\n  }\n} catch (e) {\n  row.review_reason = String(e.message || e).slice(0, 300);\n}\nreturn [{ json: row }];\n"
+      }
+    },
+    {
+      "id": "a7",
+      "name": "Save to Sheet (no duplicates)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1440,
+        -100
+      ],
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Contracts",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "file_id"
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "a8",
+      "name": "Needs Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        -100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $('Parse Result').first().json.status }}",
+              "rightValue": "needs_review",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a9",
+      "name": "Review Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1920,
+        -200
+      ],
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@company.com",
+        "emailType": "html",
+        "subject": "=Contract needs manual review: {{ $('Parse Result').first().json.file_name }}",
+        "message": "=<p>Claude could not read this contract with enough confidence.</p><p><b>File:</b> <a href=\"{{ $('Parse Result').first().json.file_link }}\">{{ $('Parse Result').first().json.file_name }}</a></p><p><b>Reason:</b> {{ $('Parse Result').first().json.review_reason }}</p><p>Open the Contracts sheet, correct the row, and set <code>status</code> to <code>ok</code> so it joins the daily check.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "a10",
+      "name": "Unsupported File Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        480,
+        140
+      ],
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@company.com",
+        "emailType": "html",
+        "subject": "=Unsupported file in contracts folder: {{ $json.name }}",
+        "message": "=<p>Only PDF files are processed. <b>{{ $json.name }}</b> ({{ $json.mimeType }}) was skipped.</p><p>Export it as PDF and re-upload.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "b1",
+      "name": "Daily 9AM Check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        400
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b2",
+      "name": "Read Contracts",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        400
+      ],
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Contracts",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "b3",
+      "name": "Find Upcoming Renewals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        400
+      ],
+      "parameters": {
+        "jsCode": "\nconst RANK = { NONE: 0, LOW: 1, MEDIUM: 2, HIGH: 3 };\nconst today = new Date(); today.setHours(0, 0, 0, 0);\nconst num = v => { const n = parseFloat(String(v ?? '').replace(/[^0-9.\\-]/g, '')); return isNaN(n) ? null : n; };\nconst out = [];\n\nfor (const item of $input.all()) {\n  const r = item.json;\n  if (!r.file_id) continue;\n  if (String(r.status || '').toLowerCase() !== 'ok') continue;   // skip needs_review / ignored rows\n  const end = new Date(r.end_date);\n  if (isNaN(end)) continue;\n  end.setHours(0, 0, 0, 0);\n\n  const daysLeft = Math.round((end - today) / 86400000);\n  if (daysLeft < 0) continue;                                      // already ended\n\n  const notice = num(r.notice_period_days) ?? 30;\n  const toDeadline = daysLeft - notice;                            // days left to cancel\n  if (toDeadline > 60) continue;                                   // not in the 60-day window yet\n\n  const level = toDeadline <= 7 ? 'HIGH' : (toDeadline <= 30 ? 'MEDIUM' : 'LOW');\n  const last = String(r.last_alert_level || 'NONE').toUpperCase();\n  const lastDate = r.last_alert_date ? new Date(r.last_alert_date) : null;\n  const daysSince = lastDate && !isNaN(lastDate) ? Math.floor((today - lastDate) / 86400000) : 9999;\n\n  const escalated = RANK[level] > (RANK[last] ?? 0);\n  const highReminder = level === 'HIGH' && daysSince >= 7;\n  if (!escalated && !highReminder) continue;                       // already alerted at this level\n\n  out.push({ json: {\n    file_id: r.file_id, file_name: r.file_name, file_link: r.file_link,\n    vendor: r.vendor, contract_type: r.contract_type, end_date: r.end_date,\n    auto_renew: /^(true|yes|1)$/i.test(String(r.auto_renew)),\n    notice_period_days: notice, annual_cost: num(r.annual_cost), currency: r.currency || '',\n    penalty_clause: r.penalty_clause || '',\n    days_left: daysLeft, days_to_cancel_deadline: toDeadline, urgency: level\n  }});\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "b4",
+      "name": "Build Alert Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        400
+      ],
+      "parameters": {
+        "jsCode": "\nconst items = $input.all().map(i => i.json);\nitems.sort((a, b) => a.days_to_cancel_deadline - b.days_to_cancel_deadline);\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst color = { HIGH: '#c0392b', MEDIUM: '#d68910', LOW: '#2e86c1' };\n\nconst atRisk = {};\nfor (const r of items) {\n  if (r.auto_renew && r.annual_cost) atRisk[r.currency || '?'] = (atRisk[r.currency || '?'] || 0) + r.annual_cost;\n}\nconst riskText = Object.entries(atRisk).map(([c, v]) => `${Math.round(v).toLocaleString('en-US')} ${c}`).join(' + ');\n\nconst rows = items.map(r => {\n  const missed = r.days_to_cancel_deadline < 0;\n  const deadlineText = missed ? `<b style=\"color:#c0392b\">MISSED ${Math.abs(r.days_to_cancel_deadline)}d ago</b>` : `<b>${r.days_to_cancel_deadline} days</b>`;\n  return `<tr>\n<td>${esc(r.vendor)}</td><td>${esc(r.contract_type)}</td><td>${esc(r.end_date)} (${r.days_left}d)</td>\n<td>${r.auto_renew ? 'Yes' : 'No'}</td>\n<td>${r.annual_cost ? Math.round(r.annual_cost).toLocaleString('en-US') + ' ' + esc(r.currency) : '-'}</td>\n<td>${r.notice_period_days}d</td><td>${deadlineText}</td>\n<td style=\"color:${color[r.urgency]}\"><b>${r.urgency}</b></td>\n<td>${esc(r.penalty_clause) || '-'}</td>\n<td><a href=\"${esc(r.file_link)}\">Open</a></td></tr>`;\n}).join('');\n\nconst html = `<div style=\"font-family:Arial,sans-serif\">\n<h2>Contract Renewal Watchdog</h2>\n<p><b>${items.length}</b> contract(s) need a decision.${riskText ? ` Auto-renewing spend at risk: <b>${riskText}</b>.` : ''}</p>\n<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\" style=\"border-collapse:collapse;font-size:13px\">\n<tr style=\"background:#f2f3f4\"><th>Vendor</th><th>Type</th><th>Ends</th><th>Auto-renew</th><th>Annual cost</th><th>Notice</th><th>Cancel deadline in</th><th>Urgency</th><th>Penalty</th><th>File</th></tr>\n${rows}</table>\n<p style=\"color:#7f8c8d;font-size:12px\">You get a new alert only when urgency increases (LOW &rarr; MEDIUM &rarr; HIGH), and a weekly reminder while HIGH.</p></div>`;\n\nreturn [{ json: { html, count: items.length } }];\n"
+      }
+    },
+    {
+      "id": "b5",
+      "name": "Send Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        960,
+        400
+      ],
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@company.com",
+        "emailType": "html",
+        "subject": "=Contract Alert: {{ $json.count }} renewal(s) need action",
+        "message": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "b6",
+      "name": "Prepare Flag Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        400
+      ],
+      "parameters": {
+        "jsCode": "\nconst today = new Date().toISOString().slice(0, 10);\nreturn $('Find Upcoming Renewals').all().map(i => ({ json: {\n  file_id: i.json.file_id,\n  last_alert_level: i.json.urgency,\n  last_alert_date: today\n}}));\n"
+      }
+    },
+    {
+      "id": "b7",
+      "name": "Mark as Alerted",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1440,
+        400
+      ],
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Contracts",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "file_id"
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "id": "c1",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        800
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "c2",
+      "name": "Format Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        800
+      ],
+      "parameters": {
+        "jsCode": "\nconst e = $json;\nconst html = `<div style=\"font-family:Arial,sans-serif\"><h3>Workflow failed: ${e.workflow?.name ?? ''}</h3>\n<p><b>Node:</b> ${e.execution?.lastNodeExecuted ?? ''}</p>\n<p><b>Error:</b> ${String(e.execution?.error?.message ?? '').replace(/</g, '&lt;')}</p>\n<p><a href=\"${e.execution?.url ?? '#'}\">Open execution</a></p></div>`;\nreturn [{ json: { html, name: e.workflow?.name ?? 'workflow' } }];\n"
+      }
+    },
+    {
+      "id": "c3",
+      "name": "Error Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        480,
+        800
+      ],
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@company.com",
+        "emailType": "html",
+        "subject": "=FAILED: {{ $json.name }}",
+        "message": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "s1",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        -420
+      ],
+      "parameters": {
+        "content": "## Contract & Renewal Watchdog v1\n\n**Setup**\n1. Replace YOUR_CONTRACTS_FOLDER_ID, YOUR_SHEET_ID (3 places), YOUR_EMAIL@company.com (4 places)\n2. Create sheet tab 'Contracts' with headers from contracts_sheet_headers.csv\n3. Credentials: Google Drive, Google Sheets, Gmail, and Header Auth (name: x-api-key, value: Anthropic key) for 'Claude: Read Contract'\n4. Workflow Settings > Error workflow > select THIS workflow\n\n**How it works**\n- A: new PDF -> Claude reads it (scanned PDFs OK) -> row saved (file_id = no duplicates). Unsure rows get status needs_review + email.\n- B: daily 9AM -> only contracts whose cancel window is open AND urgency increased -> one email -> marked as alerted.\n- C: any crash -> email.\n\nFix a needs_review row by editing it and setting status = ok.",
+        "height": 460,
+        "width": 640
+      }
+    }
+  ],
+  "connections": {
+    "Contract Uploaded": {
+      "main": [
+        [
+          {
+            "node": "Is PDF?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is PDF?": {
+      "main": [
+        [
+          {
+            "node": "Download Contract",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unsupported File Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Contract": {
+      "main": [
+        [
+          {
+            "node": "Prepare Claude Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Claude Request": {
+      "main": [
+        [
+          {
+            "node": "Claude: Read Contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude: Read Contract": {
+      "main": [
+        [
+          {
+            "node": "Parse Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Result": {
+      "main": [
+        [
+          {
+            "node": "Save to Sheet (no duplicates)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Sheet (no duplicates)": {
+      "main": [
+        [
+          {
+            "node": "Needs Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Review?": {
+      "main": [
+        [
+          {
+            "node": "Review Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 9AM Check": {
+      "main": [
+        [
+          {
+            "node": "Read Contracts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Contracts": {
+      "main": [
+        [
+          {
+            "node": "Find Upcoming Renewals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Upcoming Renewals": {
+      "main": [
+        [
+          {
+            "node": "Build Alert Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Alert Email": {
+      "main": [
+        [
+          {
+            "node": "Send Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Alert": {
+      "main": [
+        [
+          {
+            "node": "Prepare Flag Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Flag Update": {
+      "main": [
+        [
+          {
+            "node": "Mark as Alerted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "pinData": {},
+  "tags": []
+}
